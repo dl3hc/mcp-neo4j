@@ -7,70 +7,37 @@ box is a **local mirror**, not the live install — deploying means changing wha
 
 Fork branch is pushed: `github.com/dl3hc/mcp-neo4j`, branch `feature/entity-locking-traversal`.
 
-## Phase 0 — find out how it's actually running on typhon
+## The simple path (recommended)
+
+The fork now has a self-contained run path — see `run.sh`, `.env.example`, and
+`contrib/mcp-neo4j-memory.service` (all added after the rest of this doc was originally
+written). This replaces the old separate-venv deployment layout entirely; there is no longer a
+reason to keep a `pip install -e`'d copy in a different directory in sync by hand.
 
 ```bash
 ssh typhon
-ps aux | grep -i mcp-neo4j-memory
-# note the PID, then:
-readlink /proc/<PID>/cwd          # the real working directory (may differ from the Windows mirror's relative path)
-cat /proc/<PID>/cmdline | tr '\0' ' '   # confirm it's run.sh's `mcp-neo4j-memory --transport http ...`
-
-# is it supervised, or just a bare process?
-systemctl --user status mcp-neo4j-memory 2>&1
-systemctl status mcp-neo4j-memory 2>&1
-tmux ls 2>&1
-screen -ls 2>&1
-```
-
-Everything below assumes you now know: the real working directory (call it `$APP_DIR`, contains
-`.venv`, `.env`, `run.sh`) and how it's kept alive (foreground/tmux/screen/systemd/nohup).
-
-## Phase 1 — get the fork's code onto typhon
-
-```bash
-# if you don't already have a checkout of the fork on typhon:
 cd ~   # or wherever you keep repos on typhon
-git clone https://github.com/dl3hc/mcp-neo4j.git
-cd mcp-neo4j
-git checkout feature/entity-locking-traversal
-
-# if you already have one, just:
-cd <path-to-mcp-neo4j-checkout-on-typhon>
-git fetch origin
-git checkout feature/entity-locking-traversal
-git pull
+git clone https://github.com/dl3hc/mcp-neo4j.git   # or, if already cloned: git pull
+cd mcp-neo4j/servers/mcp-neo4j-memory
+git checkout feature/entity-locking-traversal      # if not already on it
+cp .env.example .env
+# edit .env: at minimum NEO4J_URI/NEO4J_USERNAME/NEO4J_PASSWORD/NEO4J_DATABASE for the real DB
+./run.sh   # foreground first, to confirm it actually connects - Ctrl+C once you see it's up
 ```
 
-## Phase 2 — install the fork into $APP_DIR's existing venv
+Once that works, either install it as a systemd service (`contrib/README.md` has the exact
+steps) or just run `./run.sh` under `tmux`/`screen`/`nohup` as before — same entry point either
+way.
 
-This swaps what `run.sh`'s `mcp-neo4j-memory` entry point actually runs, without changing
-`run.sh` itself.
+**If an old separate-venv deployment (a directory with its own `.venv`/`.env`/`run.sh`, `pip
+install`ed rather than a git checkout) is still what's actually running**, stop that process and
+point traffic at this new checkout's `run.sh` instead, rather than trying to patch the old
+venv in place. Whatever port/host it was bound to (`.env`'s `NEO4J_MCP_SERVER_PORT`, etc.),
+match it in the new `.env` so nothing else (like the SSH tunnel config) needs to change.
 
-```bash
-cd "$APP_DIR"
-source .venv/bin/activate
-pip install -e /path/to/mcp-neo4j/servers/mcp-neo4j-memory
-# (use `uv pip install -e ...` instead if this venv was built with uv - check for a uv.lock
-# or how it was originally set up)
-
-python -c "import mcp_neo4j_memory; print(mcp_neo4j_memory.__file__)"
-# should now point INTO the git checkout (…/mcp-neo4j/servers/mcp-neo4j-memory/src/…),
-# not into .venv/lib/python3.*/site-packages/ - if it still shows site-packages, the
-# editable install didn't take; re-run pip install -e with -v to see why.
-deactivate
-```
-
-## Phase 3 — restart
-
-Do **not** add `--enforce-locks` to `run.sh` yet — keep the default (off: guard violations are
-logged, never block a write) until the new behavior has been observed for a while.
-
-- **Foreground terminal / nohup**: `kill <PID>` from Phase 0, then start it the same way it was
-  running before (re-attach to the same tmux/screen window and re-run `./run.sh`, or
-  `nohup ./run.sh > server.log 2>&1 & disown` if that's how it was started).
-- **systemd**: `sudo systemctl restart mcp-neo4j-memory` (or whatever the unit is actually
-  called per Phase 0).
+Do **not** set `NEO4J_MEMORY_ENFORCE_LOCKS=true` in `.env` yet — keep the default (off: guard
+violations are logged, never block a write) until the new behavior has been observed for a
+while in real use.
 
 ## Phase 4 — verify
 
@@ -120,5 +87,17 @@ a tool that doesn't exist yet (the same mistake just fixed for `MemSession`/`Mem
 
 **Do not** run `tests/integration/test_locking_IT.py` against this production instance — its
 fixtures `DETACH DELETE` all `:Memory` nodes as cleanup after every test, which would wipe the
-real memory graph. Integration verification needs an isolated Neo4j (a testcontainer, or a
-second throwaway database) — never the production bolt connection.
+real memory graph. It also needs Docker (`tests/integration/conftest.py` spins up a
+`Neo4jContainer` via testcontainers), which this environment doesn't have either.
+
+Docker-free options for real integration verification, in order of preference:
+1. **A second, native Neo4j install on typhon** (plain tarball/package, not a container),
+   bound to different ports (e.g. bolt `7688`), used only for tests. Community Edition only
+   supports one user database per instance, so this needs a genuinely separate process, not
+   just a second database name on the same one.
+2. **Manual, careful smoke-testing against production**: the read-only tools
+   (`get_map`/`get_neighbors`/`find_path`/`lock_status`) are safe to call directly. For the
+   write-path guards (self-loop rejection, dangling-target rejection, lock contention,
+   `expectedVersion` CAS), create clearly-named throwaway entities by hand
+   (e.g. `_smoketest_...`), exercise the tool, then delete exactly those entities yourself with
+   `delete_entities` — never run the automated test suite's fixtures against this graph.
