@@ -22,7 +22,8 @@ def main():
     parser.add_argument("--server-path", default=None, help="HTTP path (default: /mcp/)")
     parser.add_argument("--allow-origins", default=None, help="Comma-separated list of allowed CORS origins")
     parser.add_argument("--allowed-hosts", default=None, help="Comma-separated list of allowed hosts for DNS rebinding protection")
-    
+    parser.add_argument("--enforce-locks", action="store_true", default=None, help="Reject writes blocked by an active lock/version guard instead of only logging them")
+
     args = parser.parse_args()
 
     config = process_config(args)

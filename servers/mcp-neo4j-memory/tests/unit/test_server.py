@@ -33,12 +33,14 @@ class TestNamespacing:
     def mock_memory(self):
         """Create a mock Neo4jMemory for testing."""
         memory = Mock(spec=Neo4jMemory)
+        # create_mcp_server constructs Neo4jLocking/Neo4jTraversal from memory.driver
+        memory.driver = Mock()
         # Mock all the async methods that the tools will call
         knowledge_graph = KnowledgeGraph(entities=[], relations=[])
         memory.read_graph = AsyncMock(return_value=knowledge_graph)
-        memory.create_entities = AsyncMock(return_value=[])
-        memory.create_relations = AsyncMock(return_value=[])
-        memory.add_observations = AsyncMock(return_value=[])
+        memory.create_entities = AsyncMock(return_value=([], []))
+        memory.create_relations = AsyncMock(return_value=([], []))
+        memory.add_observations = AsyncMock(return_value=([], []))
         memory.delete_entities = AsyncMock(return_value=None)
         memory.delete_observations = AsyncMock(return_value=None)
         memory.delete_relations = AsyncMock(return_value=None)
@@ -62,7 +64,13 @@ class TestNamespacing:
             "test-ns-delete_observations",
             "test-ns-delete_relations",
             "test-ns-search_memories",
-            "test-ns-find_memories_by_name"
+            "test-ns-find_memories_by_name",
+            "test-ns-acquire_lock",
+            "test-ns-release_lock",
+            "test-ns-lock_status",
+            "test-ns-get_neighbors",
+            "test-ns-find_path",
+            "test-ns-get_map",
         ]
         
         for expected_tool in expected_tools:
@@ -81,7 +89,13 @@ class TestNamespacing:
             "delete_observations",
             "delete_relations",
             "search_memories",
-            "find_memories_by_name"
+            "find_memories_by_name",
+            "acquire_lock",
+            "release_lock",
+            "lock_status",
+            "get_neighbors",
+            "find_path",
+            "get_map",
         ]
         
         for expected_tool in expected_default_tools:
@@ -167,6 +181,6 @@ class TestNamespacing:
         # Should have the same number of tools
         assert len(default_tools) == len(namespaced_tools)
         
-        # Verify we have the expected number of tools (9 tools based on the server implementation)
-        assert len(default_tools) == 9
-        assert len(namespaced_tools) == 9
+        # Verify we have the expected number of tools (9 original + 3 lock + 3 traversal)
+        assert len(default_tools) == 15
+        assert len(namespaced_tools) == 15

@@ -187,5 +187,16 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
         else:
             logger.info("Info: No namespace provided for tools. No namespace will be used.")
             config["namespace"] = ""
-    
+
+    # parse lock enforcement (rollout flag - default off: violations are logged, not blocked)
+    if getattr(args, "enforce_locks", None) is not None:
+        config["enforce_locks"] = args.enforce_locks
+    else:
+        env_value = os.getenv("NEO4J_MEMORY_ENFORCE_LOCKS")
+        if env_value is not None:
+            config["enforce_locks"] = env_value.strip().lower() in ("1", "true", "yes")
+        else:
+            logger.info("Info: No lock enforcement setting provided. Defaulting to off (violations are logged only).")
+            config["enforce_locks"] = False
+
     return config

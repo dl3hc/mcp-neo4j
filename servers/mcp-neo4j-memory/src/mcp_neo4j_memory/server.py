@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Literal
+from typing import Literal, Optional
 
 from neo4j import AsyncGraphDatabase
 from pydantic import Field
@@ -15,7 +15,11 @@ from mcp.types import TextContent
 from neo4j.exceptions import Neo4jError
 from mcp.types import ToolAnnotations
 
+from . import guards
 from .neo4j_memory import Neo4jMemory, Entity, Relation, ObservationAddition, ObservationDeletion, KnowledgeGraph
+from .locking import Neo4jLocking
+from .lock_tools import register_lock_tools
+from .traversal import Neo4jTraversal, register_traversal_tools
 from .utils import format_namespace
 
 # Set up logging
@@ -23,31 +27,36 @@ logger = logging.getLogger('mcp_neo4j_memory')
 logger.setLevel(logging.INFO)
 
 
-
+def _guard_error(e: guards.GuardViolation) -> ToolError:
+    return ToolError(
+        f"{len(e.blocked)} of {len(e.blocked) + len(e.applied)} item(s) blocked by a lock/version guard: {e.blocked}"
+    )
 
 
 def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
     """Create an MCP server instance for memory management."""
-    
+
     namespace_prefix = format_namespace(namespace)
     mcp: FastMCP = FastMCP("mcp-neo4j-memory", stateless_http=True)
+    locking = Neo4jLocking(memory.driver)
+    traversal = Neo4jTraversal(memory.driver)
 
     @mcp.tool(
         name=namespace_prefix + "read_graph",
-        annotations=ToolAnnotations(title="Read Graph", 
-                                          readOnlyHint=True, 
-                                          destructiveHint=False, 
-                                          idempotentHint=True, 
+        annotations=ToolAnnotations(title="Read Graph",
+                                          readOnlyHint=True,
+                                          destructiveHint=False,
+                                          idempotentHint=True,
                                           openWorldHint=True))
     async def read_graph() -> ToolResult:
         """Read the entire knowledge graph with all entities and relationships.
-        
+
         Returns the complete memory graph including all stored entities and their relationships.
         Use this to get a full overview of stored knowledge.
-        
+
         Returns:
             KnowledgeGraph: Complete graph with all entities and relations
-            
+
         Example response:
         {
             "entities": [
@@ -73,21 +82,24 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
 
     @mcp.tool(
         name=namespace_prefix + "create_entities",
-        annotations=ToolAnnotations(title="Create Entities", 
-                                          readOnlyHint=False, 
-                                          destructiveHint=False, 
-                                          idempotentHint=True, 
+        annotations=ToolAnnotations(title="Create Entities",
+                                          readOnlyHint=False,
+                                          destructiveHint=False,
+                                          idempotentHint=True,
                                           openWorldHint=True))
-    async def create_entities(entities: list[Entity] = Field(..., description="List of entities to create with name, type, and observations")) -> ToolResult:
+    async def create_entities(
+        entities: list[Entity] = Field(..., description="List of entities to create with name, type, and observations"),
+        agent_id: Optional[str] = Field(default=None, description="Your agent id - required to override your own active lock on an existing entity"),
+    ) -> ToolResult:
         """Create multiple new entities in the knowledge graph.
-        
+
         Creates new memory entities with their associated observations. If an entity with the same name
         already exists, this operation will merge the observations with existing ones.
-        
-            
+
+
         Returns:
             list[Entity]: The created entities with their final state
-            
+
         Example call:
         {
             "entities": [
@@ -98,7 +110,7 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
                 },
                 {
                     "name": "Microsoft",
-                    "type": "company", 
+                    "type": "company",
                     "observations": ["Technology company", "Headquartered in Redmond, WA"]
                 }
             ]
@@ -107,9 +119,14 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
         logger.info(f"MCP tool: create_entities ({len(entities)} entities)")
         try:
             entity_objects = [Entity.model_validate(entity) for entity in entities]
-            result = await memory.create_entities(entity_objects)
+            result, warnings = await memory.create_entities(entity_objects, agent_id=agent_id)
+            content = {"result": [e.model_dump() for e in result]}
+            if warnings:
+                content["warnings"] = warnings
             return ToolResult(content=[TextContent(type="text", text=json.dumps([e.model_dump() for e in result]))],
-                          structured_content={"result": result})
+                          structured_content=content)
+        except guards.GuardViolation as e:
+            raise _guard_error(e)
         except Neo4jError as e:
             logger.error(f"Neo4j error creating entities: {e}")
             raise ToolError(f"Neo4j error creating entities: {e}")
@@ -119,26 +136,33 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
 
     @mcp.tool(
         name=namespace_prefix + "create_relations",
-        annotations=ToolAnnotations(title="Create Relations", 
-                                          readOnlyHint=False, 
-                                          destructiveHint=False, 
-                                          idempotentHint=True, 
+        annotations=ToolAnnotations(title="Create Relations",
+                                          readOnlyHint=False,
+                                          destructiveHint=False,
+                                          idempotentHint=True,
                                           openWorldHint=True))
-    async def create_relations(relations: list[Relation] = Field(..., description="List of relations to create between existing entities")) -> ToolResult:
+    async def create_relations(
+        relations: list[Relation] = Field(..., description="List of relations to create between existing entities"),
+        agent_id: Optional[str] = Field(default=None, description="Your agent id - required to override your own active lock on source/target entities"),
+    ) -> ToolResult:
         """Create multiple new relationships between existing entities in the knowledge graph.
-        
+
         Creates directed relationships between entities that already exist. Both source and target
-        entities must already be present in the graph. Use descriptive relationship types.
-        
+        entities must already be present in the graph AND must already carry at least one
+        observation - a target with none is rejected as a "dangling" stub (populate it first).
+        Self-loops (source == target) are rejected. relationType is validated against the
+        curated vocabulary in neo4j-schema.md; RELATED_TO or an off-vocabulary type is still
+        created but flagged as typing debt in the response's `warnings`.
+
         Returns:
             list[Relation]: The created relationships
-            
+
         Example call:
         {
             "relations": [
                 {
                     "source": "Alice Johnson",
-                    "target": "Microsoft", 
+                    "target": "Microsoft",
                     "relationType": "WORKS_AT"
                 },
                 {
@@ -152,9 +176,14 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
         logger.info(f"MCP tool: create_relations ({len(relations)} relations)")
         try:
             relation_objects = [Relation.model_validate(relation) for relation in relations]
-            result = await memory.create_relations(relation_objects)
+            result, warnings = await memory.create_relations(relation_objects, agent_id=agent_id)
+            content = {"result": [r.model_dump() for r in result]}
+            if warnings:
+                content["warnings"] = warnings
             return ToolResult(content=[TextContent(type="text", text=json.dumps([r.model_dump() for r in result]))],
-                          structured_content={"result": result})
+                          structured_content=content)
+        except guards.GuardViolation as e:
+            raise _guard_error(e)
         except Neo4jError as e:
             logger.error(f"Neo4j error creating relations: {e}")
             raise ToolError(f"Neo4j error creating relations: {e}")
@@ -164,20 +193,26 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
 
     @mcp.tool(
         name=namespace_prefix + "add_observations",
-        annotations=ToolAnnotations(title="Add Observations", 
-                                          readOnlyHint=False, 
-                                          destructiveHint=False, 
-                                          idempotentHint=True, 
+        annotations=ToolAnnotations(title="Add Observations",
+                                          readOnlyHint=False,
+                                          destructiveHint=False,
+                                          idempotentHint=True,
                                           openWorldHint=True))
-    async def add_observations(observations: list[ObservationAddition] = Field(..., description="List of observations to add to existing entities")) -> ToolResult:
+    async def add_observations(
+        observations: list[ObservationAddition] = Field(..., description="List of observations to add to existing entities"),
+        agent_id: Optional[str] = Field(default=None, description="Your agent id - required to override your own active lock on the target entity"),
+    ) -> ToolResult:
         """Add new observations/facts to existing entities in the knowledge graph.
-        
+
         Appends new observations to entities that already exist. The entity must be present
         in the graph before adding observations. Each observation should be a distinct fact.
-        
+        If an entity crosses ~5 observations, the response's `warnings` carries a
+        `decomposeHint` nudging you to apply the query-independence test from
+        entity-model.md - it is never a hard block, decomposition needs judgment.
+
         Returns:
             list[dict]: Details about the added observations including entity name and new facts
-            
+
         Example call:
         {
             "observations": [
@@ -195,9 +230,14 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
         logger.info(f"MCP tool: add_observations ({len(observations)} additions)")
         try:
             observation_objects = [ObservationAddition.model_validate(obs) for obs in observations]
-            result = await memory.add_observations(observation_objects)
+            result, warnings = await memory.add_observations(observation_objects, agent_id=agent_id)
+            content = {"result": result}
+            if warnings:
+                content["warnings"] = warnings
             return ToolResult(content=[TextContent(type="text", text=json.dumps(result))],
-                          structured_content={"result": result})
+                          structured_content=content)
+        except guards.GuardViolation as e:
+            raise _guard_error(e)
         except Neo4jError as e:
             logger.error(f"Neo4j error adding observations: {e}")
             raise ToolError(f"Neo4j error adding observations: {e}")
@@ -207,32 +247,37 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
 
     @mcp.tool(
         name=namespace_prefix + "delete_entities",
-        annotations=ToolAnnotations(title="Delete Entities", 
-                                          readOnlyHint=False, 
-                                          destructiveHint=True, 
-                                          idempotentHint=True, 
+        annotations=ToolAnnotations(title="Delete Entities",
+                                          readOnlyHint=False,
+                                          destructiveHint=True,
+                                          idempotentHint=True,
                                           openWorldHint=True))
-    async def delete_entities(entityNames: list[str] = Field(..., description="List of exact entity names to delete permanently")) -> ToolResult:
+    async def delete_entities(
+        entityNames: list[str] = Field(..., description="List of exact entity names to delete permanently"),
+        agent_id: Optional[str] = Field(default=None, description="Your agent id - required to override your own active lock on the entity"),
+    ) -> ToolResult:
         """Delete entities and all their associated relationships from the knowledge graph.
-        
+
         Permanently removes entities from the graph along with all relationships they participate in.
         This is a destructive operation that cannot be undone. Entity names must match exactly.
-        
+
         Returns:
             str: Success confirmation message
-            
+
         Example call:
         {
             "entityNames": ["Old Company", "Outdated Person"]
         }
-        
+
         Warning: This will delete the entities and ALL relationships they're involved in.
         """
         logger.info(f"MCP tool: delete_entities ({len(entityNames)} entities)")
         try:
-            await memory.delete_entities(entityNames)
+            await memory.delete_entities(entityNames, agent_id=agent_id)
             return ToolResult(content=[TextContent(type="text", text="Entities deleted successfully")],
                               structured_content={"result": "Entities deleted successfully"})
+        except guards.GuardViolation as e:
+            raise _guard_error(e)
         except Neo4jError as e:
             logger.error(f"Neo4j error deleting entities: {e}")
             raise ToolError(f"Neo4j error deleting entities: {e}")
@@ -242,20 +287,23 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
 
     @mcp.tool(
         name=namespace_prefix + "delete_observations",
-        annotations=ToolAnnotations(title="Delete Observations", 
-                                          readOnlyHint=False, 
-                                          destructiveHint=True, 
-                                          idempotentHint=True, 
+        annotations=ToolAnnotations(title="Delete Observations",
+                                          readOnlyHint=False,
+                                          destructiveHint=True,
+                                          idempotentHint=True,
                                           openWorldHint=True))
-    async def delete_observations(deletions: list[ObservationDeletion] = Field(..., description="List of specific observations to remove from entities")) -> ToolResult:
+    async def delete_observations(
+        deletions: list[ObservationDeletion] = Field(..., description="List of specific observations to remove from entities"),
+        agent_id: Optional[str] = Field(default=None, description="Your agent id - required to override your own active lock on the entity"),
+    ) -> ToolResult:
         """Delete specific observations from existing entities in the knowledge graph.
-        
+
         Removes specific observation texts from entities. The observation text must match exactly
         what is stored. The entity will remain but the specified observations will be deleted.
-        
+
         Returns:
             str: Success confirmation message
-            
+
         Example call:
         {
             "deletions": [
@@ -264,20 +312,22 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
                     "observations": ["Old job title", "Outdated phone number"]
                 },
                 {
-                    "entityName": "Microsoft", 
+                    "entityName": "Microsoft",
                     "observations": ["Former CEO information"]
                 }
             ]
         }
-        
+
         Note: Observation text must match exactly (case-sensitive) to be deleted.
         """
         logger.info(f"MCP tool: delete_observations ({len(deletions)} deletions)")
-        try:    
+        try:
             deletion_objects = [ObservationDeletion.model_validate(deletion) for deletion in deletions]
-            await memory.delete_observations(deletion_objects)
+            await memory.delete_observations(deletion_objects, agent_id=agent_id)
             return ToolResult(content=[TextContent(type="text", text="Observations deleted successfully")],
                           structured_content={"result": "Observations deleted successfully"})
+        except guards.GuardViolation as e:
+            raise _guard_error(e)
         except Neo4jError as e:
             logger.error(f"Neo4j error deleting observations: {e}")
             raise ToolError(f"Neo4j error deleting observations: {e}")
@@ -287,21 +337,24 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
 
     @mcp.tool(
         name=namespace_prefix + "delete_relations",
-        annotations=ToolAnnotations(title="Delete Relations", 
-                                          readOnlyHint=False, 
-                                          destructiveHint=True, 
-                                          idempotentHint=True, 
+        annotations=ToolAnnotations(title="Delete Relations",
+                                          readOnlyHint=False,
+                                          destructiveHint=True,
+                                          idempotentHint=True,
                                           openWorldHint=True))
-    async def delete_relations(relations: list[Relation] = Field(..., description="List of specific relationships to delete from the graph")) -> ToolResult:
+    async def delete_relations(
+        relations: list[Relation] = Field(..., description="List of specific relationships to delete from the graph"),
+        agent_id: Optional[str] = Field(default=None, description="Your agent id - required to override your own active lock on source/target entities"),
+    ) -> ToolResult:
         """Delete specific relationships between entities in the knowledge graph.
-        
-        Removes relationships while keeping the entities themselves. The source, target, and 
+
+        Removes relationships while keeping the entities themselves. The source, target, and
         relationship type must match exactly for deletion. This only affects the relationships,
         not the entities they connect.
-        
+
         Returns:
             str: Success confirmation message
-            
+
         Example call:
         {
             "relations": [
@@ -311,21 +364,23 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
                     "relationType": "WORKS_AT"
                 },
                 {
-                    "source": "John Smith", 
+                    "source": "John Smith",
                     "target": "Former City",
                     "relationType": "LIVES_IN"
                 }
             ]
         }
-        
+
         Note: All fields (source, target, relationType) must match exactly for deletion.
         """
         logger.info(f"MCP tool: delete_relations ({len(relations)} relations)")
         try:
             relation_objects = [Relation.model_validate(relation) for relation in relations]
-            await memory.delete_relations(relation_objects)
+            await memory.delete_relations(relation_objects, agent_id=agent_id)
             return ToolResult(content=[TextContent(type="text", text="Relations deleted successfully")],
                           structured_content={"result": "Relations deleted successfully"})
+        except guards.GuardViolation as e:
+            raise _guard_error(e)
         except Neo4jError as e:
             logger.error(f"Neo4j error deleting relations: {e}")
             raise ToolError(f"Neo4j error deleting relations: {e}")
@@ -335,26 +390,26 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
 
     @mcp.tool(
         name=namespace_prefix + "search_memories",
-        annotations=ToolAnnotations(title="Search Memories", 
-                                          readOnlyHint=True, 
-                                          destructiveHint=False, 
-                                          idempotentHint=True, 
+        annotations=ToolAnnotations(title="Search Memories",
+                                          readOnlyHint=True,
+                                          destructiveHint=False,
+                                          idempotentHint=True,
                                           openWorldHint=True))
     async def search_memories(query: str = Field(..., description="Fulltext search query to find entities by name, type, or observations")) -> ToolResult:
         """Search for entities in the knowledge graph using fulltext search.
-        
+
         Searches across entity names, types, and observations using Neo4j's fulltext index.
         Returns matching entities and their related connections. Supports partial matches
         and multiple search terms.
-        
+
         Returns:
             KnowledgeGraph: Subgraph containing matching entities and their relationships
-            
+
         Example call:
         {
             "query": "engineer software"
         }
-        
+
         This searches for entities containing "engineer" or "software" in their name, type, or observations.
         """
         logger.info(f"MCP tool: search_memories ('{query}')")
@@ -368,28 +423,28 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
         except Exception as e:
             logger.error(f"Error searching memories: {e}")
             raise ToolError(f"Error searching memories: {e}")
-        
+
     @mcp.tool(
         name=namespace_prefix + "find_memories_by_name",
         annotations=ToolAnnotations(title="Find Memories by Name",
-                                          readOnlyHint=True, 
-                                          destructiveHint=False, 
-                                          idempotentHint=True, 
+                                          readOnlyHint=True,
+                                          destructiveHint=False,
+                                          idempotentHint=True,
                                           openWorldHint=True))
     async def find_memories_by_name(names: list[str] = Field(..., description="List of exact entity names to retrieve")) -> ToolResult:
         """Find specific entities by their exact names.
-        
+
         Retrieves entities that exactly match the provided names, along with all their
         relationships and connected entities. Use this when you know the exact entity names.
-        
+
         Returns:
             KnowledgeGraph: Subgraph containing the specified entities and their relationships
-            
+
         Example call:
         {
             "names": ["Alice Johnson", "Microsoft", "Seattle"]
         }
-        
+
         This retrieves the entities with exactly those names plus their connections.
         """
         logger.info(f"MCP tool: find_memories_by_name ({len(names)} names)")
@@ -403,6 +458,9 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
         except Exception as e:
             logger.error(f"Error finding memories by name: {e}")
             raise ToolError(f"Error finding memories by name: {e}")
+
+    register_lock_tools(mcp, locking, namespace_prefix)
+    register_traversal_tools(mcp, traversal, namespace_prefix)
 
     return mcp
 
@@ -419,17 +477,19 @@ async def main(
     path: str = "/mcp/",
     allow_origins: list[str] = [],
     allowed_hosts: list[str] = [],
+    enforce_locks: bool = False,
 ) -> None:
     logger.info(f"Starting Neo4j MCP Memory Server")
     logger.info(f"Connecting to Neo4j with DB URL: {neo4j_uri}")
+    logger.info(f"Lock enforcement: {'ON' if enforce_locks else 'OFF (violations are logged only)'}")
 
     # Connect to Neo4j
     neo4j_driver = AsyncGraphDatabase.driver(
         neo4j_uri,
-        auth=(neo4j_user, neo4j_password), 
+        auth=(neo4j_user, neo4j_password),
         database=neo4j_database
     )
-    
+
     # Verify connection
     try:
         await neo4j_driver.verify_connectivity()
@@ -439,12 +499,13 @@ async def main(
         exit(1)
 
     # Initialize memory
-    memory = Neo4jMemory(neo4j_driver)
+    memory = Neo4jMemory(neo4j_driver, enforce_locks=enforce_locks)
     logger.info("Neo4jMemory initialized")
-    
-    # Create fulltext index
+
+    # Create fulltext index + the :Memory(name) uniqueness constraint and lock-expiry index
     await memory.create_fulltext_index()
-    
+    await memory.ensure_constraints()
+
     # Configure security middleware
     custom_middleware = [
         Middleware(
