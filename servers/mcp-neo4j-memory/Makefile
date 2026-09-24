@@ -2,6 +2,9 @@ docker-local-build-run:
 	docker build -t mcp-neo4j-memory .
 	docker run -p 8000:8000 mcp-neo4j-memory:latest
 
+run:
+	./run.sh
+
 install-dev:
 	uv run python3 -m uv pip install -e .
 
